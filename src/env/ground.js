@@ -623,7 +623,10 @@ export function createGroundAssets({ anisotropy = 1 } = {}) {
     uSwardTile: { value: S.tile },
     /** relief depth (m), fade start, fade end (m), self-shadow strength */
     uPom: { value: new THREE.Vector4(S.depth, S.fade[0], S.fade[1], S.shadow) },
-    uPomSteps: { value: new THREE.Vector2(S.steps[0], S.steps[1]) },
+    uPomSteps: { value: new THREE.Vector2(
+      (typeof window !== 'undefined' && window.innerWidth * window.innerHeight >= 3_500_000) ? Math.min(S.steps[0], 3) : S.steps[0],
+      (typeof window !== 'undefined' && window.innerWidth * window.innerHeight >= 3_500_000) ? Math.min(S.steps[1], 8) : S.steps[1]
+    ) },
     uSwardLook: { value: new THREE.Vector3(S.contrast, S.occlusion, 0) },
     uSwardDry: { value: new THREE.Color(...S.dry) },
     /** How far hex tiling turns each copy of the relief (1 a full turn; ripples keep to the wind). */

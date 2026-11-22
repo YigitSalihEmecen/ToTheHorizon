@@ -7,6 +7,10 @@
 
 import { alea, clamp, lerp, smoothstep } from './util.js';
 import { TERRAIN, WORLD_BIOME } from './config.js';
+import { createWasmTerrainHandle } from './wasm/terrain.js';
+
+const WASM_OFF = (typeof location !== 'undefined' && /[?&]wasm=0\b/.test(location.search))
+  || (typeof process !== 'undefined' && process.env?.NO_WASM === '1');
 
 /* ------------------------------------------------------- gradient noise -- */
 
@@ -27,7 +31,7 @@ function makeGradNoise(random) {
   const perm = new Uint8Array(512);
   for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
 
-  return function noise(x, y, out) {
+  const fn = function noise(x, y, out) {
     const ix = Math.floor(x), iy = Math.floor(y);
     const fx = x - ix, fy = y - iy;
 
@@ -58,6 +62,8 @@ function makeGradNoise(random) {
            + u * v * (ga[1] - gb[1] - gc[1] + gd[1]) + dv * (k2 + u * k3);
     return out;
   };
+  fn.perm = perm;
+  return fn;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -380,6 +386,65 @@ export function createTerrain(seed) {
 
   function mask(x, z, freq, ox = 0, oz = 0) {
     return fbm(nC, x + ox, z + oz, freq, 2, 0.5) * 0.5 + 0.5;
+  }
+
+  const wasm = WASM_OFF ? null : createWasmTerrainHandle(nA.perm, nB.perm, nC.perm, nW.perm);
+
+  if (wasm) {
+    const { bind, views, mod } = wasm;
+    const wBase = (x, z, octaves = 99) => { bind(TERRAIN, WORLD_BIOME); return mod.base_one(x, z, octaves); };
+    const wHeight = (x, z, lateral) => { bind(TERRAIN, WORLD_BIOME); return mod.height_one(x, z, lateral); };
+    const wContinent = (x, z) => { bind(TERRAIN, WORLD_BIOME); return mod.continent_one(x, z); };
+    const wRegion = (x, z) => { bind(TERRAIN, WORLD_BIOME); return mod.region_one(x, z); };
+    const wForestDensity = (x, z) => { bind(TERRAIN, WORLD_BIOME); return mod.forest_density_one(x, z); };
+    const wMask = (x, z, freq, ox = 0, oz = 0) => { bind(TERRAIN, WORLD_BIOME); return mod.mask_one(x, z, freq, ox, oz); };
+    const wRoadElevation = (x, z) => {
+      bind(TERRAIN, WORLD_BIOME);
+      const r = 30;
+      let sum = mod.base_one(x, z, 99) * 2;
+      for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2;
+        sum += mod.base_one(x + Math.cos(a) * r, z + Math.sin(a) * r, 99);
+      }
+      return sum / 8;
+    };
+    const heightBatch = (count) => {
+      bind(TERRAIN, WORLD_BIOME);
+      mod.height_batch(count);
+      return views.outY;
+    };
+    const groundNoiseBatch = (count) => {
+      bind(TERRAIN, WORLD_BIOME);
+      mod.ground_noise_batch(count);
+      return views;
+    };
+    const tpi = (x, z) => { bind(TERRAIN, WORLD_BIOME); return mod.tpi_one(x, z); };
+    const buildTileGeom = (H, step, drop) => {
+      views.tileH.set(H);
+      mod.build_tile_geom(step, drop);
+      return { pos: views.tilePos, nor: views.tileNor };
+    };
+    // Keep tiny 1-2 octave scalar lookups (nA, nB, nC, mask, forestDensity, continent)
+    // in V8-inlined JS to avoid JS<->WASM boundary overhead on millions of tiny calls;
+    // route all heavy multi-octave & batch work to Rust/WASM!
+    return {
+      base: wBase,
+      height: wHeight,
+      roadElevation: wRoadElevation,
+      region: wRegion,
+      archetypes,
+      forestDensity,
+      mask,
+      continent,
+      tpi,
+      buildTileGeom,
+      nA: (x, z) => nA(x, z, t0)[0],
+      nB: (x, z) => nB(x, z, t0)[0],
+      nC: (x, z) => nC(x, z, t0)[0],
+      wasmViews: views,
+      heightBatch,
+      groundNoiseBatch,
+    };
   }
 
   return {

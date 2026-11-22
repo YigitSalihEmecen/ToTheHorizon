@@ -234,7 +234,10 @@ export function createRoadAssets({ anisotropy = 1, cover: ground = null } = {}) 
     /** patch chance fresh, old, sealed share, lane width */
     uDamage: { value: new THREE.Vector4(S.patch[0], S.patch[1], S.sealShare, 3.7) },
     uPom: { value: new THREE.Vector3(S.pom.depth, S.pom.fade[0], S.pom.fade[1]) },
-    uPomSteps: { value: new THREE.Vector2(S.pom.steps[0], S.pom.steps[1]) },
+    uPomSteps: { value: new THREE.Vector2(
+      (typeof window !== 'undefined' && window.innerWidth * window.innerHeight >= 3_500_000) ? Math.min(S.pom.steps[0], 2) : S.pom.steps[0],
+      (typeof window !== 'undefined' && window.innerWidth * window.innerHeight >= 3_500_000) ? Math.min(S.pom.steps[1], 6) : S.pom.steps[1]
+    ) },
     /** The markings, as chunks.js lays them: half width, lane, line width, centre gap; dash length. */
     // Outer edge of the edge line; the dashed joint (none on a single lane each way).
     uPaint: { value: new THREE.Vector4(ROAD.halfWidth - ROAD.edgeInset,

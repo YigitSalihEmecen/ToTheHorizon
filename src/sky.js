@@ -61,7 +61,12 @@ export const SKY_FRAG = /* glsl */ `
   }
   float fbm(vec2 p) {
     float a = 0.0, w = 0.5;
-    for (int i = 0; i < 5; i++) { a += w * vnoise(p); p *= 2.03; w *= 0.5; }
+    for (int i = 0; i < 4; i++) { a += w * vnoise(p); p *= 2.03; w *= 0.5; }
+    return a;
+  }
+  float fbm3(vec2 p) {
+    float a = 0.0, w = 0.5;
+    for (int i = 0; i < 3; i++) { a += w * vnoise(p); p *= 2.03; w *= 0.5; }
     return a;
   }
 
@@ -104,7 +109,7 @@ export const SKY_FRAG = /* glsl */ `
     float band = smoothstep(0.02, 0.36, h);
     vec2 cuv = dir.xz / max(0.16, h + 0.08) * 0.9 + vec2(uTime * 0.004, uTime * 0.0016);
     float n = fbm(cuv * 1.35);
-    float wisp = fbm(cuv * 3.7 + n);
+    float wisp = fbm3(cuv * 3.7 + n);
     float lo = mix(0.52, 0.20, uCloud), hi = mix(0.86, 0.62, uCloud);
     float cloud = smoothstep(lo, hi, n * 0.72 + wisp * 0.42) * band;
     // thicker cloud is darker underneath

@@ -139,6 +139,28 @@ export async function boot() {
   await frame();
   chunks.preload(START_S);
 
+  // Pre-compile bridge PBR/parallax shaders during boot so the first bridge
+  // encountered mid-drive does not trigger a 150 ms synchronous shader compile stall.
+  if (bridgeMaterials) {
+    const dummyGeo = new THREE.BufferGeometry();
+    dummyGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
+    dummyGeo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]), 3));
+    dummyGeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array([0, 0, 1, 0, 0, 1]), 2));
+    const warm = new THREE.Group();
+    warm.position.set(0, -1e4, 0);
+    for (const mat of Object.values(bridgeMaterials)) {
+      if (mat && mat.isMaterial) {
+        const m = new THREE.Mesh(dummyGeo, mat);
+        m.frustumCulled = false;
+        warm.add(m);
+      }
+    }
+    gfx.scene.add(warm);
+    gfx.renderer.compile(gfx.scene, gfx.camera);
+    gfx.scene.remove(warm);
+    dummyGeo.dispose();
+  }
+
   // Rapier refreshes its query pipeline only in step(); ray casts return
   // null until one has run.
   world.step();

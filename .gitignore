@@ -5,3 +5,4 @@ package-lock.json
 dist
 .vscode
 .engine_sim_backup
+wasm/*/target

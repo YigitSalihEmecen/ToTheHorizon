@@ -30,6 +30,48 @@ const N = 32;               // cells per tile side
 const V = N + 1;            // vertices per side
 const G = V + 2;            // with the one-cell normal apron
 
+// Precomputed ONCE for all tiles: identical topology for every 32x32 tile + skirt!
+const BORDER = new Uint16Array(4 * V);
+{
+  let bi = 0;
+  for (let t = 0; t < V; t++) BORDER[bi++] = t;
+  for (let t = 0; t < V; t++) BORDER[bi++] = N * V + t;
+  for (let t = 0; t < V; t++) BORDER[bi++] = t * V;
+  for (let t = 0; t < V; t++) BORDER[bi++] = t * V + N;
+}
+const SHARED_IDX_RAW = new Uint32Array(N * N * 6 + 4 * N * 6);
+let SHARED_MAIN_TRIS = 0;
+const SHARED_BOTH = (() => {
+  let t = 0;
+  for (let vj = 0; vj < N; vj++) {
+    for (let vi = 0; vi < N; vi++) {
+      const a = vj * V + vi, b = a + 1, cc = a + V, d = cc + 1;
+      SHARED_IDX_RAW[t++] = a; SHARED_IDX_RAW[t++] = cc; SHARED_IDX_RAW[t++] = b;
+      SHARED_IDX_RAW[t++] = b; SHARED_IDX_RAW[t++] = cc; SHARED_IDX_RAW[t++] = d;
+    }
+  }
+  SHARED_MAIN_TRIS = t;
+  const skirtSide = (rowStart, step1, skirtStart) => {
+    for (let q = 0; q < N; q++) {
+      const a = rowStart + q * step1, b = rowStart + (q + 1) * step1;
+      const sa = skirtStart + q, sb = skirtStart + q + 1;
+      SHARED_IDX_RAW[t++] = a; SHARED_IDX_RAW[t++] = b; SHARED_IDX_RAW[t++] = sa;
+      SHARED_IDX_RAW[t++] = b; SHARED_IDX_RAW[t++] = sb; SHARED_IDX_RAW[t++] = sa;
+    }
+  };
+  skirtSide(0, 1, V * V);
+  skirtSide(N * V, 1, V * V + V);
+  skirtSide(0, V, V * V + 2 * V);
+  skirtSide(N, V, V * V + 3 * V);
+  const both = new Uint32Array(t + (t - SHARED_MAIN_TRIS));
+  both.set(SHARED_IDX_RAW.subarray(0, t));
+  for (let q = SHARED_MAIN_TRIS, w = t; q < t; q += 3, w += 3) {
+    both[w] = SHARED_IDX_RAW[q]; both[w + 1] = SHARED_IDX_RAW[q + 2]; both[w + 2] = SHARED_IDX_RAW[q + 1];
+  }
+  return both;
+})();
+const SHARED_CIDX = SHARED_IDX_RAW.slice(0, SHARED_MAIN_TRIS);
+
 export class WorldTiles {
   /**
    * @param {object} o
@@ -216,13 +258,8 @@ export class WorldTiles {
     for (let gj = 0; gj < G; gj++) {
       const z = z0 + (gj - 1) * step;
       f.beginRegion(x0 - step, z, x0 + s + step, z);
-      for (let gi = 0; gi < G; gi++) {
-        const x = x0 + (gi - 1) * step;
-        f.sample(x, z, smp);
-        H[gj * G + gi] = smp.y;
-        // Under a bridge is not the roadside: no verge down in the gap.
-        if (gi >= 1 && gi <= V && gj >= 1 && gj <= V) D[(gj - 1) * V + (gi - 1)] = smp.open > 0.5 ? 1e4 : smp.d;
-      }
+      const isInnerRow = gj >= 1 && gj <= V;
+      f.sampleRow(x0 - step, z, step, G, H, gj * G, D, isInnerRow ? (gj - 1) * V : 0, isInnerRow ? 1 : G, isInnerRow ? V : -1);
       f.endRegion();
       yield;
     }
@@ -238,74 +275,83 @@ export class WorldTiles {
     const br = new Float32Array(vCount * 2);
     const ext = this._bare || (this._bare = { rock: 0, soil: 0 });
     for (let k = 0; k < V * V; k++) rd[k] = Math.min(D[k], 1e4);
+
+    // Precompute all 6 ground-color noise channels for all V*V vertices in ONE WASM call!
+    let gn = null;
+    const pre = this._pre || (this._pre = { fine: 0, broad: 0, cont: 0, m1: 0, m2: 0, m3: 0 });
+    if (f.terrain.groundNoiseBatch) {
+      const v = f.terrain.wasmViews;
+      const inX = v.inX, inZ = v.inZ;
+      let idx0 = 0;
+      for (let vj = 0; vj < V; vj++) {
+        const wz = z0 + vj * step;
+        for (let vi = 0; vi < V; vi++) {
+          inX[idx0] = x0 + vi * step;
+          inZ[idx0] = wz;
+          idx0++;
+        }
+      }
+      gn = f.terrain.groundNoiseBatch(V * V);
+    }
+
+    const drop = TILES.skirt * step + 1.5;
+    // Compute main grid + skirt positions and normals in WASM in one pass when available.
+    if (f.terrain.buildTileGeom) {
+      const geom = f.terrain.buildTileGeom(H, step, drop);
+      pos.set(geom.pos);
+      nor.set(geom.nor);
+    }
+
     const c = this._color;
+    const hasWasmGeom = !!f.terrain.buildTileGeom;
     for (let vj = 0; vj < V; vj++) {
       // The palette reads the landform (a TPI lattice it fills as it goes):
       // a far tile's first colouring was a 78 ms frame in one step.
       if ((vj & 3) === 3) yield;
       for (let vi = 0; vi < V; vi++) {
-        const g = (vj + 1) * G + (vi + 1);
-        const y = H[g];
-        const dx = (H[g + 1] - H[g - 1]) / (2 * step);
-        const dz = (H[g + G] - H[g - G]) / (2 * step);
-        const inv = 1 / Math.sqrt(1 + dx * dx + dz * dz);
-        const k = (vj * V + vi) * 3;
-        pos[k] = vi * step; pos[k + 1] = y; pos[k + 2] = vj * step;
-        nor[k] = -dx * inv; nor[k + 1] = inv; nor[k + 2] = -dz * inv;
-        const jit = this.colorFn(x0 + vi * step, z0 + vj * step, y, inv, D[vj * V + vi], c, -dx * inv, -dz * inv, ext);
+        const vi2 = vj * V + vi;
+        const k = vi2 * 3;
+        let y, nx, ny, nz;
+        if (hasWasmGeom) {
+          y = pos[k + 1];
+          nx = nor[k]; ny = nor[k + 1]; nz = nor[k + 2];
+        } else {
+          const g = (vj + 1) * G + (vi + 1);
+          y = H[g];
+          const dx = (H[g + 1] - H[g - 1]) / (2 * step);
+          const dz = (H[g + G] - H[g - G]) / (2 * step);
+          ny = 1 / Math.sqrt(1 + dx * dx + dz * dz);
+          nx = -dx * ny; nz = -dz * ny;
+          pos[k] = vi * step; pos[k + 1] = y; pos[k + 2] = vj * step;
+          nor[k] = nx; nor[k + 1] = ny; nor[k + 2] = nz;
+        }
+        let preArg = null;
+        if (gn) {
+          pre.fine = gn.outFine[vi2];
+          pre.broad = gn.outBroad[vi2];
+          pre.cont = gn.outCont[vi2];
+          pre.m1 = gn.outM1[vi2];
+          pre.m2 = gn.outM2[vi2];
+          pre.m3 = gn.outM3[vi2];
+          preArg = pre;
+        }
+        const jit = this.colorFn(x0 + vi * step, z0 + vj * step, y, ny, D[vi2], c, nx, nz, ext, preArg);
         col[k] = c.r * jit; col[k + 1] = c.g * jit; col[k + 2] = c.b * jit;
-        const kb = (vj * V + vi) * 2;
+        const kb = vi2 * 2;
         br[kb] = ext.rock; br[kb + 1] = ext.soil;
       }
     }
-    // Skirts: copy each border vertex, dropped by a depth that grows with the
-    // cell size (a coarse neighbour's chord can sit that far off).
-    const drop = TILES.skirt * step + 1.5;
-    const border = [];
-    for (let t = 0; t < V; t++) border.push(t);                       // z = 0 row
-    for (let t = 0; t < V; t++) border.push(N * V + t);              // z = max row
-    for (let t = 0; t < V; t++) border.push(t * V);                  // x = 0 column
-    for (let t = 0; t < V; t++) border.push(t * V + N);              // x = max column
-    for (let b = 0; b < border.length; b++) {
-      const src = border[b] * 3, dst = (V * V + b) * 3;
-      pos[dst] = pos[src]; pos[dst + 1] = pos[src + 1] - drop; pos[dst + 2] = pos[src + 2];
-      nor[dst] = nor[src]; nor[dst + 1] = nor[src + 1]; nor[dst + 2] = nor[src + 2];
-      rd[V * V + b] = rd[border[b]];
-      br[(V * V + b) * 2] = br[border[b] * 2]; br[(V * V + b) * 2 + 1] = br[border[b] * 2 + 1];
+    // Skirts: copy colours/attributes (pos/nor already filled by WASM when available).
+    for (let b = 0; b < BORDER.length; b++) {
+      const bi = BORDER[b];
+      const src = bi * 3, dst = (V * V + b) * 3;
+      if (!hasWasmGeom) {
+        pos[dst] = pos[src]; pos[dst + 1] = pos[src + 1] - drop; pos[dst + 2] = pos[src + 2];
+        nor[dst] = nor[src]; nor[dst + 1] = nor[src + 1]; nor[dst + 2] = nor[src + 2];
+      }
+      rd[V * V + b] = rd[bi];
+      br[(V * V + b) * 2] = br[bi * 2]; br[(V * V + b) * 2 + 1] = br[bi * 2 + 1];
       col[dst] = col[src] * 0.8; col[dst + 1] = col[src + 1] * 0.8; col[dst + 2] = col[src + 2] * 0.8;
-    }
-
-    const idx = new Uint32Array(N * N * 6 + 4 * N * 6);
-    let t = 0;
-    for (let vj = 0; vj < N; vj++) {
-      for (let vi = 0; vi < N; vi++) {
-        const a = vj * V + vi, b = a + 1, cc = a + V, d = cc + 1;
-        // Upward faces (+x then +z is clockwise seen from above in three's
-        // right-handed frame, so a, cc, b).
-        idx[t++] = a; idx[t++] = cc; idx[t++] = b;
-        idx[t++] = b; idx[t++] = cc; idx[t++] = d;
-      }
-    }
-    const mainTris = t;
-    // Skirt quads, wound outward per side; drawn double-sided anyway via a
-    // second winding so the orientation can never hide one.
-    const skirtSide = (rowStart, step1, skirtStart) => {
-      for (let q = 0; q < N; q++) {
-        const a = rowStart + q * step1, b = rowStart + (q + 1) * step1;
-        const sa = skirtStart + q, sb = skirtStart + q + 1;
-        idx[t++] = a; idx[t++] = b; idx[t++] = sa;
-        idx[t++] = b; idx[t++] = sb; idx[t++] = sa;
-      }
-    };
-    skirtSide(0, 1, V * V);              // z = 0
-    skirtSide(N * V, 1, V * V + V);      // z = max
-    skirtSide(0, V, V * V + 2 * V);      // x = 0
-    skirtSide(N, V, V * V + 3 * V);      // x = max
-    // Skirts need both faces (which side is "out" differs per edge).
-    const both = new Uint32Array(t + (t - mainTris));
-    both.set(idx.subarray(0, t));
-    for (let q = mainTris, w = t; q < t; q += 3, w += 3) {
-      both[w] = idx[q]; both[w + 1] = idx[q + 2]; both[w + 2] = idx[q + 1];
     }
 
     const geo = new THREE.BufferGeometry();
@@ -314,13 +360,14 @@ export class WorldTiles {
     geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
     geo.setAttribute('roadDist', new THREE.BufferAttribute(rd, 1));
     geo.setAttribute('bare', new THREE.BufferAttribute(br, 2));
-    geo.setIndex(new THREE.BufferAttribute(both, 1));
+    geo.setIndex(new THREE.BufferAttribute(SHARED_BOTH, 1));
     geo.computeBoundingSphere();
 
     const mesh = new THREE.Mesh(geo, this.material);
     mesh.position.set(x0, 0, z0);
     mesh.receiveShadow = true;
-    mesh.castShadow = l <= 1;
+    // Shadow box is 78 m around the car; only level-0 (64 m) tiles meaningfully cast into it.
+    mesh.castShadow = l === 0;
     mesh.matrixAutoUpdate = false;
     mesh.updateMatrix();
     mesh.userData.tile = true;
@@ -329,7 +376,7 @@ export class WorldTiles {
     const tile = {
       l, i, j, mesh, collider: null, stale: false,
       // Collider data: the main grid only.
-      cpos: pos.subarray(0, V * V * 3), cidx: idx.slice(0, mainTris),
+      cpos: pos.subarray(0, V * V * 3), cidx: SHARED_CIDX,
       dist(fx, fz) {
         const dx = Math.max(x0 - fx, 0, fx - (x0 + s));
         const dz = Math.max(z0 - fz, 0, fz - (z0 + s));
