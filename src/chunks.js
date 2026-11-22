@@ -318,7 +318,7 @@ export class ChunkManager {
     this.field.onGrow.push(() => { if (this._gyCache) this._gyCache.clear(); });
     this.tiles = new WorldTiles({
       scene, field: this.field, material: this.matTerrain, world, RAPIER,
-      color: (x, z, y, ny, d, out, nx, nz, bare) => this._groundColor(x, z, y, ny, d, out, nx, nz, bare),
+      color: (x, z, y, ny, d, out, nx, nz, bare, pre) => this._groundColor(x, z, y, ny, d, out, nx, nz, bare, pre),
     });
     /** Where the tiles are centred. main.js points this at the car; null = the road at carS. */
     this.focus = null;
@@ -1208,15 +1208,15 @@ export class ChunkManager {
    *
    * @returns {number} the value jitter applied, so callers can reuse it
    */
-  _groundColor(x, z, y, ny, av, out, nx = 0, nz = 0, bare = null) {
+  _groundColor(x, z, y, ny, av, out, nx = 0, nz = 0, bare = null, pre = null) {
     // Two mottles, ~70 m and ~350 m, put patches inside regions rather than a
     // single graded wash.
-    const fine = this.terrain.nC(x * 0.014, z * 0.014) * 0.5 + 0.5;
-    const broad = this.terrain.nB(x * 0.0029, z * 0.0029) * 0.5 + 0.5;
+    const fine = pre ? pre.fine : this.terrain.nC(x * 0.014, z * 0.014) * 0.5 + 0.5;
+    const broad = pre ? pre.broad : this.terrain.nB(x * 0.0029, z * 0.0029) * 0.5 + 0.5;
 
     // Height above the LOCAL base, not absolute: the map rises and falls by
     // hundreds of metres.
-    const rel = y - this.terrain.continent(x, z);
+    const rel = y - (pre ? pre.cont : this.terrain.continent(x, z));
 
     const alt = smoothstep(20, 210, rel);
     out.copy(this._grassDeep).lerp(this._grassLow, smoothstep(0.28, 0.62, broad + alt * 0.25));
@@ -1241,9 +1241,9 @@ export class ChunkManager {
     // Plant communities, in patches tens of metres across with soft edges:
     // bracken on slopes, heather on high crests, fresh sward on the flat,
     // rush in the wet hollows.
-    const m1 = this.terrain.mask(x, z, 0.012, 311, -97);
-    const m2 = this.terrain.mask(x, z, 0.009, -523, 410);
-    const m3 = this.terrain.mask(x, z, 0.016, 77, 1203);
+    const m1 = pre ? pre.m1 : this.terrain.mask(x, z, 0.012, 311, -97);
+    const m2 = pre ? pre.m2 : this.terrain.mask(x, z, 0.009, -523, 410);
+    const m3 = pre ? pre.m3 : this.terrain.mask(x, z, 0.016, 77, 1203);
     out.lerp(this._bracken, smoothstep(0.6, 0.68, m1) * lerp(0.35, 0.85, smoothstep(0.98, 0.82, ny)) * (1 - hollow));
     out.lerp(this._heather, smoothstep(0.6, 0.68, m2) * clamp(ridge * 0.8 + alt * 0.6, 0, 0.8));
     out.lerp(this._fresh, smoothstep(0.6, 0.68, m3) * (1 - ridge) * 0.55);
@@ -1349,7 +1349,8 @@ export class ChunkManager {
     let v = this._tpiCache.get(key);
     if (v === undefined) {
       const t = this.terrain, x = i * 64, z = j * 64, R = 120;
-      v = t.base(x, z, 3) - 0.25 * (t.base(x + R, z, 3) + t.base(x - R, z, 3) + t.base(x, z + R, 3) + t.base(x, z - R, 3));
+      v = t.tpi ? t.tpi(x, z)
+        : t.base(x, z, 3) - 0.25 * (t.base(x + R, z, 3) + t.base(x - R, z, 3) + t.base(x, z + R, 3) + t.base(x, z - R, 3));
       // ponytail: whole-cache clear at 200k entries (~40 km of road); an LRU if a long run ever stutters on it.
       if (this._tpiCache.size > 200000) this._tpiCache.clear();
       this._tpiCache.set(key, v);

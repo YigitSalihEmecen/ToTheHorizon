@@ -336,6 +336,128 @@ export class TerrainField {
 
   height(x, z) { return this.sample(x, z, null); }
 
+  /**
+   * Batch-samples one horizontal row of `count` points at `x = x0 + i * step, z`.
+   * Evaluates all `terrain.height()` calls in a single WASM `height_batch()` pass
+   * when available, then applies bridge/lake/town/road carves per point.
+   */
+  sampleRow(x0, z, step, count, outH, hOff, outD, dOff, innerStart, innerEnd) {
+    const t = this.terrain;
+    if (!t.heightBatch) {
+      const smp = this._rowSmp || (this._rowSmp = { y: 0, natural: 0, d: 0, s: 0, v: 0, open: 0 });
+      for (let gi = 0; gi < count; gi++) {
+        this.sample(x0 + gi * step, z, smp);
+        outH[hOff + gi] = smp.y;
+        if (gi >= innerStart && gi <= innerEnd) outD[dOff + gi - innerStart] = smp.open > 0.5 ? 1e4 : smp.d;
+      }
+      return;
+    }
+
+    const views = t.wasmViews;
+    const inX = views.inX, inZ = views.inZ, inLat = views.inLat;
+    const dMins = this._rowDMin || (this._rowDMin = new Float64Array(64));
+    // Cache passes per point so `_gather` runs ONCE per point instead of twice!
+    const MAX_P = 8;
+    const pCount = this._rowPCount || (this._rowPCount = new Uint8Array(64));
+    const pDense = this._rowPDense || (this._rowPDense = new Uint8Array(64 * MAX_P));
+    const pJ = this._rowPJ || (this._rowPJ = new Int32Array(64 * MAX_P));
+    const pD = this._rowPD || (this._rowPD = new Float64Array(64 * MAX_P));
+    const pT = this._rowPT || (this._rowPT = new Float64Array(64 * MAX_P));
+    const pY = this._rowPY || (this._rowPY = new Float64Array(64 * MAX_P));
+
+    // Pass 1: settle lakes & gather road passes ONCE per point in the row.
+    const R = this._region;
+    const hasRoad = !R || R.dense.length > 0 || R.coarse.length > 0;
+    for (let gi = 0; gi < count; gi++) {
+      const x = x0 + gi * step;
+      this.lakes.at(x, z);
+      let dMin = FAR;
+      let np = 0;
+      if (hasRoad) {
+        np = this._gather(x, z);
+        const base = gi * MAX_P;
+        for (let i = 0; i < np; i++) {
+          const P = this._passes[i];
+          if (P.d < dMin) dMin = P.d;
+          pDense[base + i] = P.dense ? 1 : 0;
+          pJ[base + i] = P.j;
+          pD[base + i] = P.d;
+          pT[base + i] = P.t;
+          pY[base + i] = P.y;
+        }
+      }
+      pCount[gi] = np;
+      inX[gi] = x;
+      inZ[gi] = z;
+      inLat[gi] = dMin;
+      dMins[gi] = dMin;
+    }
+
+    // Pass 2: ONE WASM batch call for the entire row's natural terrain heights!
+    const outY = t.heightBatch(count);
+
+    // Pass 3: apply bridge/lake/town/road carves using cached passes.
+    for (let gi = 0; gi < count; gi++) {
+      const x = x0 + gi * step;
+      const dMin = dMins[gi];
+      const natural0 = outY[gi];
+      const gapped = this.bridges ? this.bridges.carve(x, z, natural0) : natural0;
+      const lakeCarved = this.lakes.carve(x, z, gapped, dMin);
+      const natural = this.towns ? this.towns.carve(x, z, lakeCarved) : lakeCarved;
+
+      let y = natural;
+      let openOut = 0;
+      const np = pCount[gi];
+      if (np > 0) {
+        const base = gi * MAX_P;
+        let num = 0, den = 0;
+        for (let i = 0; i < np; i++) {
+          const pd = pD[base + i];
+          let yRoad, av = pd, bankY = 0, sink = 0, open = 0;
+          if (pDense[base + i]) {
+            const pts = this.path.pts;
+            const pj = pJ[base + i];
+            const a = pts[pj], b = pts[pj + 1];
+            const s = a.s + (b.s - a.s) * pT[base + i];
+            const f = this.path.frameAt(s, this._frameScratch());
+            const rx = -f.tan.z, rz = f.tan.x;
+            const rl = Math.hypot(rx, rz) || 1;
+            const v = ((x - f.pos.x) * rx + (z - f.pos.z) * rz) / rl;
+            av = Math.abs(v);
+            const bankFade = 1 - smoothstep(EDGE, EDGE + CHUNK.bankRunout, av);
+            bankY = v * Math.tan(f.bank) * bankFade;
+            yRoad = f.pos.y + bankY;
+            sink = ROAD_SINK * (1 - smoothstep(ROAD.halfWidth - 0.6, ROAD.halfWidth + 0.9, av));
+            if (this.bridges) open = this.bridges.open(x, z, s);
+            if (pd === dMin) openOut = open;
+          } else {
+            yRoad = pY[base + i];
+          }
+          const tt = Math.max(0, av - EDGE);
+          const ramp = (tt * tt) / (tt + ROAD.shoulderRound);
+          const ceiling = yRoad + ROAD.cutSlope * ramp;
+          const floorY = yRoad - ROAD.fillSlope * ramp;
+          const k = Math.min(ROAD.slopeBlend, (ceiling - floorY) * 0.25);
+          let yi = smax(smin(natural, ceiling, k), floorY, k);
+          const dt = clamp((av - EDGE) / CHUNK.ditchWidth, 0, 1);
+          if (dt > 0 && dt < 1) {
+            const fit = 1 - smoothstep(1.5, 8.0, Math.abs(natural - yRoad));
+            yi -= CHUNK.ditchDepth * Math.sin(Math.PI * dt) * fit;
+          }
+          yi -= sink;
+          if (open > 0) yi += (Math.min(natural, ceiling) - yi) * open;
+          const e = Math.max(pd - EDGE, 0);
+          const w = Math.exp(-(pd - dMin) / CARVE_FALLOFF) / (e * e + 1);
+          num += w * yi;
+          den += w;
+        }
+        if (den > 0) y = num / den;
+      }
+      outH[hOff + gi] = y;
+      if (gi >= innerStart && gi <= innerEnd) outD[dOff + gi - innerStart] = openOut > 0.5 ? 1e4 : dMin;
+    }
+  }
+
   _frameScratch() {
     if (!this._frame) {
       this._frame = {

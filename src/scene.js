@@ -91,24 +91,30 @@ const FINISH = {
       vec4 c = texture2D(tDiffuse, vUv);
       vec2 toCentre = vUv - vec2(0.5);
       if (uStrength > 0.0005) {
-        // Lens fringing: red and blue split outward, only at speed.
-        vec2 split = toCentre * dot(toCentre, toCentre) * uStrength * 0.25;
-        c.r = texture2D(tDiffuse, vUv - split).r;
-        c.b = texture2D(tDiffuse, vUv + split).b;
-      }
-      if (uStrength > 0.0005) {
-        // Sharp core, then the smear grows quadratically toward the corners.
-        float falloff = smoothstep(uInner, 0.72, length(toCentre));
-        float amount = uStrength * falloff * falloff;
-        vec4 sum = c;
-        float weight = 1.0;
-        for (int i = 1; i <= 8; i++) {
-          float t = float(i) / 8.0;
-          float w = 1.0 - t * 0.55;
-          sum += texture2D(tDiffuse, vUv - toCentre * amount * t) * w;
-          weight += w;
+        float r2 = dot(toCentre, toCentre);
+        // Lens fringing: red and blue split outward, only at speed and off-centre.
+        if (r2 > 0.015) {
+          vec2 split = toCentre * r2 * uStrength * 0.25;
+          c.r = texture2D(tDiffuse, vUv - split).r;
+          c.b = texture2D(tDiffuse, vUv + split).b;
         }
-        c = sum / weight;
+        // Sharp core, then the smear grows quadratically toward the corners.
+        // Skip the 8-tap loop completely inside the sharp centre (saves ~40 % of 4K taps).
+        if (r2 > uInner * uInner) {
+          float falloff = smoothstep(uInner, 0.72, sqrt(r2));
+          float amount = uStrength * falloff * falloff;
+          if (amount > 0.0005) {
+            vec4 sum = c;
+            float weight = 1.0;
+            for (int i = 1; i <= 8; i++) {
+              float t = float(i) / 8.0;
+              float w = 1.0 - t * 0.55;
+              sum += texture2D(tDiffuse, vUv - toCentre * amount * t) * w;
+              weight += w;
+            }
+            c = sum / weight;
+          }
+        }
       }
 
       // Split tone: warm the highlights, cool the shadows, for depth.
@@ -164,12 +170,15 @@ export async function createScene(container) {
   });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, ATMOSPHERE.maxPixelRatio));
   renderer.setSize(window.innerWidth, window.innerHeight);
+  const drawSize0 = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const isHiRes = drawSize0.x * drawSize0.y >= 3_500_000;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   // Neutral rather than ACES: its shoulder crushes highlights into glare.
   renderer.toneMapping = THREE.NeutralToneMapping;
   renderer.toneMappingExposure = ATMOSPHERE.exposure;
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  // At 4K (>3.5 MP), PCFShadowMap avoids the 9-tap PCFSoftShadowMap cost across 8.3M pixels.
+  renderer.shadowMap.type = isHiRes ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
   container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
@@ -193,7 +202,8 @@ export async function createScene(container) {
 
   const sun = new THREE.DirectionalLight(ATMOSPHERE.sunColor, ATMOSPHERE.sunIntensity);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(ATMOSPHERE.shadowMapSize, ATMOSPHERE.shadowMapSize);
+  const shadowRes = isHiRes ? Math.min(ATMOSPHERE.shadowMapSize, 1024) : ATMOSPHERE.shadowMapSize;
+  sun.shadow.mapSize.set(shadowRes, shadowRes);
   sun.shadow.camera.near = 1;
   sun.shadow.camera.far = 420;
   const r = ATMOSPHERE.shadowRadius;
@@ -301,11 +311,14 @@ export async function createScene(container) {
         0.7,
         ATMOSPHERE.bloomThreshold
       );
-      // Quarter resolution (the pass halves what it is given): at strength 0.1
-      // the bloom is a soft glow, and its dozen blur passes were ~90 ms of a
-      // SwiftShader 720p frame at half resolution.
+      // Quarter resolution (the pass halves what it is given), capped at 480 px
+      // on the long edge: bloom is a soft low-frequency glow (strength 0.14), so
+      // running its ~11 blur passes at 1920x1080 on a 4K display only burns fill.
       const bloomSize = bloom.setSize.bind(bloom);
-      bloom.setSize = (w, h) => bloomSize(Math.max(2, w / 2), Math.max(2, h / 2));
+      bloom.setSize = (w, h) => {
+        const s = Math.min(0.5, 480 / Math.max(1, w, h));
+        bloomSize(Math.max(2, Math.round(w * s)), Math.max(2, Math.round(h * s)));
+      };
       composer.addPass(bloom);
       bloomPass = bloom;
     }
@@ -316,7 +329,9 @@ export async function createScene(container) {
     composer.addPass(vignette);
     if (ATMOSPHERE.speedBlur > 0) speedBlur = vignette;
     // After tone mapping: FXAA finds edges by luma in display space.
-    if (ATMOSPHERE.fxaa) {
+    // Skip FXAA at native 4K (>=3.5 MP): eliminates an entire 66 MB HalfFloat
+    // render target write + 8.3M-pixel full-screen pass so OutputPass draws directly to screen.
+    if (ATMOSPHERE.fxaa && !isHiRes) {
       const fxaa = new ShaderPass(FXAAShader);
       // The composer sizes passes in device pixels; FXAA wants one texel.
       fxaa.setSize = (w, h) => fxaa.uniforms.resolution.value.set(1 / w, 1 / h);
